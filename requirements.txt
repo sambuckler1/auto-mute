@@ -1,0 +1,7 @@
+ai-edge-litert
+mlx-whisper
+numpy
+pynput
+pyobjc-framework-AVFoundation
+scipy
+sounddevice
