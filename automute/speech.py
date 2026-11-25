@@ -36,31 +36,32 @@ Examples:
 "no matter where game day takes you, we'll be there" -> AD
 "Bet $5 and get $250 in bonus bets if your team wins. Must be 21 plus" -> AD
 "the ultimate tailgate starts with an ice cold" -> AD
-{music_note}{break_note}
+{music_note}
 Answer with exactly one word: GAME or AD.
 
 Transcript: "{text}"
 """
 
 MUSIC_NOTE = "There is music playing under this speech, which is more common in ads and promos.\n"
-BREAK_NOTE = ("We are currently in a commercial break, which is several ads in a row. Only answer GAME "
-              "if this is clearly the live game commentary coming back (plays, downs, score, players on "
-              "the field); product talk, slogans, and staged dialogue are still AD.\n")
+# The prompt deliberately says nothing about whether we're currently muted: telling the model
+# "we're in a break" made it echo the current state (25% of transcripts flipped on that alone).
 
 
 # Phrases that settle the question without asking an LLM. Commentators essentially never say
 # the ad ones, and ad copy rarely uses play-by-play vocabulary (promos for other games mention
 # kickoffs, but also say "on Fox"/"at noon", so mixed transcripts go to the LLMs instead).
+# Sponsor phrases ("presented by", "brought to you by") are left to the LLMs: commentators read
+# them during the game ("first half stats are brought to you by Little Caesars").
 AD_CUES = re.compile(
-    r"\b(msrp|apr|financing|lease (a|the|for)|per month|a month for|dot com|\w\.com|visit \w+|"
+    r"\b(msrp|apr|financing|lease (a|the|for)|per month|a month for|dot com|\w\.com|"
+    r"visit (?!(with|and)\b)\w+|"
     r"download (the|our)|app store|promo code|terms (and conditions )?apply|restrictions apply|"
     r"limited time|offer ends|while supplies last|ask your doctor|side effects|call (now|today)|"
     r"order (now|today)|sportsbook|bonus bets|must be 21|participating|available (now|at)|"
     r"only on (fox|cbs|nbc|espn|abc|peacock|prime|netflix|paramount)|streaming (now|on)|"
     r"(on|at) (fox|cbs|nbc|espn|abc) (this|next|sunday|saturday|monday|tonight)|"
     r"(saturday|sunday|monday|thursday|tonight|tomorrow) on (fox|cbs|nbc|espn|abc|peacock|prime)|"
-    r"brought to you by|presented by|sponsored by|official (sub|sponsor|partner|beer|pizza)|"
-    r"\d+ ?(%|percent) off|save up to|starting at \$?\d)",
+    r"\d+ ?(%|percent) off|save up to|starting at \$?\d)\b",
     re.IGNORECASE)
 GAME_CUES = re.compile(
     r"\b((first|second|third|fourth) (and|down)\b|yard line|\d+[- ]yard|touchdown|field goal|"
@@ -89,12 +90,10 @@ class Verdict:
     strong: bool = False  # decided by an unmistakable phrase rather than the LLMs
 
 
-def classify_transcript(text: str, model: str, music: bool = False, in_break: bool = False,
-                        timeout_s: float = 10) -> str | None:
+def classify_transcript(text: str, model: str, music: bool = False, timeout_s: float = 10) -> str | None:
     body = json.dumps({
         "model": model,
-        "prompt": PROMPT.format(text=text, music_note=MUSIC_NOTE if music else "",
-                                break_note=BREAK_NOTE if in_break else ""),
+        "prompt": PROMPT.format(text=text, music_note=MUSIC_NOTE if music else ""),
         "stream": False,
         "keep_alive": "30m",
         "options": {"temperature": 0, "num_predict": 3},
@@ -109,22 +108,19 @@ def classify_transcript(text: str, model: str, music: bool = False, in_break: bo
     return None
 
 
-def classify_with_panel(text: str, models: list[str], music: bool, in_break: bool) -> str | None:
-    """Ask several models at once; the state only changes if they all agree.
+def classify_with_panel(text: str, models: list[str], music: bool) -> tuple[str | None, str]:
+    """Ask several models at once and return (label, reason); label is None unless they all agree.
 
-    During a break every model has to say GAME to count as GAME, and during the game every model
-    has to say AD to count as AD. Models make different mistakes (one leans AD, another GAME),
-    so requiring agreement to change state filters out most single-model errors.
+    A split panel means the transcript is ambiguous, so it produces no verdict rather than a vote
+    for either side (previously a split counted as whichever label kept the current state).
     """
-    if len(models) == 1:
-        return classify_transcript(text, models[0], music, in_break)
     with ThreadPoolExecutor(max_workers=len(models)) as pool:
-        answers = list(pool.map(lambda m: classify_transcript(text, m, music, in_break), models))
+        answers = list(pool.map(lambda m: classify_transcript(text, m, music), models))
     if None in answers:
-        return None
-    if in_break:
-        return "GAME" if all(a == "GAME" for a in answers) else "AD"
-    return "AD" if all(a == "AD" for a in answers) else "GAME"
+        return None, "llm_unparseable"
+    if len(set(answers)) > 1:
+        return None, "panel_split"
+    return answers[0], ""
 
 
 def check_ollama(models: list[str]) -> None:
@@ -182,9 +178,10 @@ class SpeechJudge:
         self.load_error: Exception | None = None
         self.latest: Verdict | None = None
         self._verdicts: deque[Verdict] = deque(maxlen=8)
-        self.music_playing = False      # set by the caller; passed to the LLM as hints
-        self.in_break = False
+        self.music_playing = False      # set by the caller; passed to the LLM as a hint
         self.errors = 0
+        self._drops: list[str] = []     # why recent attempts produced no verdict; see take_drops()
+        self._drops_lock = threading.Lock()  # separate from _lock, which push() holds when it drops
 
     def push(self, block: np.ndarray) -> None:
         with self._lock:
@@ -204,6 +201,8 @@ class SpeechJudge:
                 if self._silent_run >= self.GAP_S * self._input_rate:
                     self._since_gap = 0
                     self._segment += 1
+                    if self._verdicts:
+                        self._drop("gap_cleared_verdicts")
                     self._verdicts.clear()
                 self._silent_run = 0
             self._since_gap = min(self._since_gap + len(block), self._window_len)
@@ -212,6 +211,17 @@ class SpeechJudge:
         with self._lock:
             audio = np.concatenate((self._ring[self._write_pos:], self._ring[:self._write_pos]))
             return audio[-self._since_gap:], self._buffer_end, self._segment
+
+    def _drop(self, reason: str) -> None:
+        """Record why an attempt produced no verdict."""
+        with self._drops_lock:
+            self._drops.append(reason)
+
+    def take_drops(self) -> list[str]:
+        """Drop reasons since the last call, for the CSV log."""
+        with self._drops_lock:
+            drops, self._drops = self._drops, []
+        return drops
 
     def recent_verdicts(self, max_age_s: float) -> list[Verdict]:
         """Verdicts on audio from the last `max_age_s` seconds, oldest first."""
@@ -240,32 +250,50 @@ class SpeechJudge:
                 self._judge_once()
             except Exception as error:
                 if self.errors == 0:
-                    print(f"\nSpeech check failed ({error!r}); falling back to music only until it recovers.")
+                    print(f"\nSpeech check failed ({error!r}); falling back to music only until it recovers."
+                          " Later failures are only written to the log (speech_dropped column).")
                 self.errors += 1
+                self._drop(f"error:{type(error).__name__}")
             self._stop.wait(max(0.0, self._interval_s - (time.monotonic() - started)))
 
     def _judge_once(self) -> None:
         audio, audio_end, segment = self._snapshot()
-        if len(audio) < self.MIN_SEGMENT_S * self._input_rate or np.sqrt(np.mean(audio ** 2)) < 1e-4:
+        if np.sqrt(np.mean(audio ** 2)) < 1e-4:
+            return  # silence; not worth logging
+        if len(audio) < self.MIN_SEGMENT_S * self._input_rate:
+            self._drop("too_soon_after_gap")
             return
         audio16k = resample_poly(audio, WHISPER_RATE, self._input_rate).astype(np.float32)
         result = self._transcribe(audio16k, path_or_hf_repo=self._whisper_model, language="en",
                                   condition_on_previous_text=False)
+        raw = " ".join(segment["text"].strip() for segment in result["segments"]).strip()
         text = " ".join(segment["text"].strip() for segment in result["segments"]
                         if segment["no_speech_prob"] < self.NO_SPEECH_PROB
                         and segment["compression_ratio"] <= self.MAX_COMPRESSION_RATIO
                         and segment["avg_logprob"] >= self.MIN_AVG_LOGPROB).strip()
         words = text.lower().split()
-        if len(words) < self.MIN_WORDS or len(set(words)) / len(words) < self.MIN_UNIQUE_WORD_RATIO:
+        if not words:
+            self._drop(f"whisper_filtered:{raw[:60]}" if raw else "whisper_empty")
+            return
+        if len(words) < self.MIN_WORDS:
+            self._drop(f"too_few_words:{text[:60]}")
+            return
+        if len(set(words)) / len(words) < self.MIN_UNIQUE_WORD_RATIO:
+            self._drop(f"repetitive:{text[:60]}")
             return
         cue = transcript_cue(text)
-        label = cue or classify_with_panel(text, self._llm_models, self.music_playing, self.in_break)
+        if cue:
+            label, reason = cue, ""
+        else:
+            label, reason = classify_with_panel(text, self._llm_models, self.music_playing)
         if not label:
+            self._drop(f"{reason}:{text[:60]}")
             return
         verdict = Verdict(label, text, audio_end - len(audio) / self._input_rate, audio_end,
                           strong=cue is not None)
         with self._lock:
             if segment != self._segment:
-                return  # a gap started a new segment while this was being transcribed
+                self._drop("stale_segment")  # a gap started a new segment while this was being transcribed
+                return
             self.latest = verdict
             self._verdicts.append(verdict)

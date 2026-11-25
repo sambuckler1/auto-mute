@@ -45,7 +45,8 @@ VERDICT_MAX_AGE_S = 6.0
 logging.getLogger("pynput").setLevel(logging.ERROR)
 
 LOG_FIELDS = ["time", "rms", "ad", "music", "game", "speech", "smoothed", "auto_says_ad",
-              "speech_present", "speech_verdict", "final_ad", "muted", "mode", "top", "transcript"]
+              "speech_present", "speech_verdict", "final_ad", "muted", "mode", "top", "transcript",
+              "speech_dropped"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -196,10 +197,13 @@ def run(args: argparse.Namespace, stop: threading.Event) -> None:
                         music_since = now
                     recent_speech.append(result["speech"])
                     recent_music.append(result["music"])
-                    speech_present = speech is not None and max(recent_speech) > SPEECH_PRESENT
+                    # Whisper producing a usable transcript also means someone is talking, even when
+                    # YAMNet's speech score is low (voiceover mixed under music and effects).
+                    heard_words = any(now - v.audio_end <= LOOKBACK_S for v in verdicts)
+                    speech_present = speech is not None and (
+                        max(recent_speech) > SPEECH_PRESENT or heard_words)
                     if speech:
                         speech.music_playing = max(recent_music) > MUSIC_PRESENT
-                        speech.in_break = router.muted
                     final_ad = arbiter.decide(now, router.muted, audio_says_ad, result["music"],
                                               speech_present, verdicts,
                                               now - music_since if music_since else 0.0)
@@ -227,6 +231,8 @@ def run(args: argparse.Namespace, stop: threading.Event) -> None:
                 print(f"\r\033[K{controller.mode:6} {state} | {status}", end="", flush=True)
 
                 if log:
+                    if speech:
+                        row["speech_dropped"] = " | ".join(speech.take_drops())
                     row.update(auto_says_ad=int(decider.is_ad), muted=int(router.muted),
                                mode=controller.mode)
                     log.writerow(row)
